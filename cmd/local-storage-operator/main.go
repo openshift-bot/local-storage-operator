@@ -31,6 +31,7 @@ import (
 	"k8s.io/klog/v2"
 
 	configv1 "github.com/openshift/api/config/v1"
+	crcommon "github.com/openshift/controller-runtime-common/pkg/tls"
 	libcrypto "github.com/openshift/library-go/pkg/crypto"
 	localv1 "github.com/openshift/local-storage-operator/api/v1"
 	localv1alpha1 "github.com/openshift/local-storage-operator/api/v1alpha1"
@@ -119,11 +120,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	adherence, err := lsotls.GetAdherencePolicyForLogging(ctx, configClient)
+	adherence, err := crcommon.FetchAPIServerTLSAdherencePolicy(ctx, configClient)
 	if err != nil {
 		klog.ErrorS(err, "failed to fetch TLS adherence policy")
 		os.Exit(1)
 	}
+	klog.Infof("TLS adherence policy: %s", adherence)
 
 	tlsProfile, err := lsotls.FetchAPIServerTLSProfile(ctx, configClient)
 	if err != nil {
@@ -207,14 +209,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Setup TLS security profile watcher to restart operator on TLS profile/adherence changes
-	tlsWatcher := lsotls.NewSecurityProfileWatcher(tlsProfile, adherence)
-	tlsWatcher.Client = mgr.GetClient()
-	if err = tlsWatcher.SetupWithManager(mgr); err != nil {
-		klog.ErrorS(err, "unable to create TLS security profile watcher")
-		os.Exit(1)
-	}
-
 	//+kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -226,8 +220,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	mgrCtx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer cancel()
+
+	// Setup TLS security profile watcher to trigger graceful shutdown on changes
+	tlsWatcher := lsotls.NewSecurityProfileWatcher(tlsProfile, adherence, cancel)
+	tlsWatcher.Client = mgr.GetClient()
+	if err = tlsWatcher.SetupWithManager(mgr); err != nil {
+		klog.ErrorS(err, "unable to create TLS security profile watcher")
+		os.Exit(1)
+	}
+
 	klog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(mgrCtx); err != nil {
 		klog.ErrorS(err, "problem running manager")
 		os.Exit(1)
 	}
