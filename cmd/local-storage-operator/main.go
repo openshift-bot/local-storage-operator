@@ -17,9 +17,12 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"crypto/tls"
 	"flag"
 	"os"
 	"runtime"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -28,6 +31,8 @@ import (
 	"k8s.io/klog/v2"
 
 	configv1 "github.com/openshift/api/config/v1"
+	crcommon "github.com/openshift/controller-runtime-common/pkg/tls"
+	libcrypto "github.com/openshift/library-go/pkg/crypto"
 	localv1 "github.com/openshift/local-storage-operator/api/v1"
 	localv1alpha1 "github.com/openshift/local-storage-operator/api/v1alpha1"
 	"github.com/openshift/local-storage-operator/pkg/common"
@@ -35,6 +40,7 @@ import (
 	lvdcontroller "github.com/openshift/local-storage-operator/pkg/controllers/localvolumediscovery"
 	lvscontroller "github.com/openshift/local-storage-operator/pkg/controllers/localvolumeset"
 	nodedaemoncontroller "github.com/openshift/local-storage-operator/pkg/controllers/nodedaemon"
+	lsotls "github.com/openshift/local-storage-operator/pkg/tls"
 	"github.com/openshift/local-storage-operator/pkg/utils"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	zaplog "go.uber.org/zap"
@@ -44,6 +50,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -102,12 +109,62 @@ func main() {
 	restConfig := ctrl.GetConfigOrDie()
 	le := utils.GetLeaderElectionConfig(restConfig, enableLeaderElection)
 
+	// Fetch TLS profile and adherence once at startup to ensure consistency
+	// Use a timeout to prevent indefinite stalls on API server outages
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	configClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		klog.ErrorS(err, "unable to create config client for TLS profile")
+		os.Exit(1)
+	}
+
+	adherence, err := crcommon.FetchAPIServerTLSAdherencePolicy(ctx, configClient)
+	if err != nil {
+		klog.ErrorS(err, "failed to fetch TLS adherence policy")
+		os.Exit(1)
+	}
+	klog.Infof("TLS adherence policy: %s", adherence)
+
+	tlsProfile, err := lsotls.FetchAPIServerTLSProfile(ctx, configClient)
+	if err != nil {
+		klog.ErrorS(err, "failed to fetch TLS profile")
+		os.Exit(1)
+	}
+
+	var tlsConfigFn func(*tls.Config)
+	if libcrypto.ShouldHonorClusterTLSProfile(adherence) {
+		var unsupportedCiphers []string
+		tlsConfigFn, unsupportedCiphers = lsotls.GetTLSConfigFromProfile(tlsProfile)
+		if len(unsupportedCiphers) > 0 {
+			klog.Warningf("TLS profile contains %d unsupported cipher suites: %v",
+				len(unsupportedCiphers), unsupportedCiphers)
+		}
+		klog.Infof("TLS adherence policy %q: using cluster TLS profile", adherence)
+	} else {
+		defaultProfile := *configv1.TLSProfiles[libcrypto.DefaultTLSProfileType]
+		var unsupportedCiphers []string
+		tlsConfigFn, unsupportedCiphers = lsotls.GetTLSConfigFromProfile(defaultProfile)
+		if len(unsupportedCiphers) > 0 {
+			klog.Warningf("Default TLS profile contains %d unsupported cipher suites: %v",
+				len(unsupportedCiphers), unsupportedCiphers)
+		}
+		klog.Infof("TLS adherence policy %q: using default Intermediate profile", adherence)
+	}
+
+	metricsOpts := metricsserver.Options{
+		BindAddress:   metricsAddr,
+		SecureServing: true,
+		TLSOpts:       []func(*tls.Config){tlsConfigFn},
+	}
+
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Cache: cache.Options{
 			DefaultNamespaces: map[string]cache.Config{namespace: {}},
 		},
 		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		Metrics:                metricsOpts,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		RenewDeadline:          &le.RenewDeadline.Duration,
@@ -151,6 +208,7 @@ func main() {
 		klog.ErrorS(err, "unable to create NodeDaemon controller")
 		os.Exit(1)
 	}
+
 	//+kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -162,8 +220,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	mgrCtx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer cancel()
+
+	// Setup TLS security profile watcher to trigger graceful shutdown on changes
+	tlsWatcher := lsotls.NewSecurityProfileWatcher(tlsProfile, adherence, cancel)
+	tlsWatcher.Client = mgr.GetClient()
+	if err = tlsWatcher.SetupWithManager(mgr); err != nil {
+		klog.ErrorS(err, "unable to create TLS security profile watcher")
+		os.Exit(1)
+	}
+
 	klog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(mgrCtx); err != nil {
 		klog.ErrorS(err, "problem running manager")
 		os.Exit(1)
 	}

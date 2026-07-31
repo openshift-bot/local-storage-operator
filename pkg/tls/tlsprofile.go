@@ -2,11 +2,13 @@ package tls
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"strings"
 
 	configv1 "github.com/openshift/api/config/v1"
 	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
+	crcommon "github.com/openshift/controller-runtime-common/pkg/tls"
 	libapiserver "github.com/openshift/library-go/pkg/operator/configobserver/apiserver"
 	libevents "github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resourcesynccontroller"
@@ -92,4 +94,18 @@ func (a *apiServerListers) ResourceSyncer() resourcesynccontroller.ResourceSynce
 
 func (a *apiServerListers) PreRunHasSynced() []cache.InformerSynced {
 	return nil
+}
+
+// GetTLSConfigFromProfile returns a function that configures a tls.Config based on
+// the provided TLS profile spec. The returned function is suitable for use with
+// controller-runtime's metricsserver.Options TLSOpts field.
+func GetTLSConfigFromProfile(profileSpec configv1.TLSProfileSpec) (func(*tls.Config), []string) {
+	configFn, unsupportedCiphers := crcommon.NewTLSConfigFromProfile(profileSpec)
+	return configFn, unsupportedCiphers
+}
+
+// FetchAPIServerTLSProfile fetches the TLS profile spec from the cluster APIServer CR.
+// This is a convenience wrapper around controller-runtime-common's function.
+func FetchAPIServerTLSProfile(ctx context.Context, c client.Client) (configv1.TLSProfileSpec, error) {
+	return crcommon.FetchAPIServerTLSProfile(ctx, c)
 }
