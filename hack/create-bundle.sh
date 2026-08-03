@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# A hackish script to build bundle and index images for the given images.
+# A hackish script to build bundle and file-based catalog images for the given images.
 # The output is available in opm-bundle directory.
 
 set -o nounset
@@ -26,7 +26,6 @@ fi
 
 set -o errexit
 
-TOOL_NAME=$(basename $TOOL_BIN)
 OPERATOR_IMAGE=$1
 DISKMAKER_IMAGE=$2
 BUNDLE_IMAGE=$3
@@ -39,6 +38,13 @@ pushd opm-bundle
 cp -r -v ../config/* .
 
 MANIFEST=manifests/stable/local-storage-operator.clusterserviceversion.yaml
+BUNDLE_NAME=$(sed -n 's/^[[:space:]]*name:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' $MANIFEST | head -n 1)
+SKIP_RANGE=$(sed -n 's/^[[:space:]]*olm\.skipRange:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' $MANIFEST)
+
+if [ -z "$BUNDLE_NAME" ]; then
+	echo "Error: Unable to determine bundle name from $MANIFEST" 1>&2
+	exit 1
+fi
 
 # Replace images in the manifest - error prone, needs to be in sync with image-references.
 sed -i.bak -e "s~quay.io/openshift/origin-local-storage-operator:latest~$OPERATOR_IMAGE~" \
@@ -50,14 +56,39 @@ rm $MANIFEST.bak
 $TOOL_BIN build -t $BUNDLE_IMAGE -f bundle.Dockerfile .
 $TOOL_BIN push $BUNDLE_IMAGE
 
-# Build the index image and push it
-$OPM_BIN index add --bundles $BUNDLE_IMAGE --tag $INDEX_IMAGE --container-tool $TOOL_NAME
+# Generate a file-based catalog with the development-only preview channel.
+CATALOG_DIR=catalog
+CATALOG=$CATALOG_DIR/catalog.yaml
+mkdir -p $CATALOG_DIR
+cat > $CATALOG <<EOF
+---
+schema: olm.package
+name: local-storage-operator
+defaultChannel: preview
+---
+schema: olm.channel
+package: local-storage-operator
+name: preview
+entries:
+  - name: $BUNDLE_NAME
+EOF
+
+if [ -n "$SKIP_RANGE" ]; then
+	printf '    skipRange: "%s"\n' "$SKIP_RANGE" >> $CATALOG
+fi
+
+$OPM_BIN render $BUNDLE_IMAGE --output yaml >> $CATALOG
+$OPM_BIN validate $CATALOG_DIR
+$OPM_BIN generate dockerfile $CATALOG_DIR
+
+# Build the catalog image and push it
+$TOOL_BIN build -t $INDEX_IMAGE -f $CATALOG_DIR.Dockerfile .
 $TOOL_BIN push $INDEX_IMAGE
 
 
 echo
 echo --------------------
-echo "Index image created"
+echo "File-based catalog image created"
 echo "Copy following snippet to apply it to your cluster"
 echo
 
