@@ -38,7 +38,10 @@ pushd opm-bundle
 cp -r -v ../config/* .
 
 MANIFEST=manifests/stable/local-storage-operator.clusterserviceversion.yaml
+# extract the name of the bundle from CSV, such as local-storage-operator.v5.0.0
 BUNDLE_NAME=$(sed -n 's/^[[:space:]]*name:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' $MANIFEST | head -n 1)
+
+# extract the skip range from CSV
 SKIP_RANGE=$(sed -n 's/^[[:space:]]*olm\.skipRange:[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' $MANIFEST)
 
 if [ -z "$BUNDLE_NAME" ]; then
